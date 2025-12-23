@@ -1120,7 +1120,7 @@ ddb_run_rm_pool(struct ddb_ctx *ctx, struct rm_pool_options *opt)
 		return -DER_BUSY;
 	}
 
-	return dv_pool_destroy(opt->path);
+	return dv_pool_destroy(opt->path, opt->db_path);
 }
 
 #define DTI_ALL "all"
