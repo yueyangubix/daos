@@ -312,6 +312,8 @@ struct vos_krec_df {
 	uint8_t				kr_pad_8;
 	/** key length */
 	uint32_t			kr_size;
+	/** Aggregation barrier epoch for this dkey */
+	daos_epoch_t			kr_agg_barrier;
 	/** Incarnation log for key */
 	struct ilog_df			kr_ilog;
 	union {

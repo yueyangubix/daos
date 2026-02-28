@@ -20,6 +20,7 @@
 #include <daos/placement.h>
 #include <daos_srv/dtx_srv.h>
 #include <daos_srv/vos_types.h>
+#include <daos_obj_class.h>
 
 #define VOS_POOL_COMPAT_FLAG_IMMUTABLE       (1ULL << 0)
 #define VOS_POOL_COMPAT_FLAG_SKIP_START      (1ULL << 1)
@@ -588,6 +589,40 @@ enum {
 	VOS_AGG_FL_FORCE_MERGE	= (1UL << 1),	/* Merge all coalesce-able EV records */
 };
 
+/* Forward declarations for aggregation callback types */
+struct agg_merge_window;
+struct vos_iter_entry;
+
+/**
+ * Callback function type for EC parity create.
+ * Called when VOS aggregation needs to trigger parity creation.
+ *
+ * \param cb_arg       [IN]	Callback argument passed to vos_aggregate()
+ * \param barrier_epoch [IN]	Barrier epoch
+ * \param dkey         [IN]	Distribution key
+ * \param oid          [IN]	Object ID
+ * \param coh          [IN]	Container handle
+ *
+ * \return			Zero on success, negative value if error
+ */
+typedef int (*vos_agg_ec_parity_create_t)(void *cb_arg, daos_epoch_t barrier_epoch,
+					    daos_key_t *dkey, daos_unit_oid_t oid,
+					    daos_handle_t coh);
+
+/**
+ * Callback function type for aggregation barrier cleanup.
+ * Called when VOS aggregation needs to cleanup stale barriers.
+ *
+ * \param cb_arg       [IN]	Callback argument passed to vos_aggregate()
+ * \param oid          [IN]	Object ID
+ * \param coh          [IN]	Container handle
+ * \param dkey         [IN]	Distribution key
+ *
+ * \return			Zero on success, negative value if error
+ */
+typedef int (*vos_agg_barrier_cleanup_t)(void *cb_arg, daos_unit_oid_t oid,
+					   daos_handle_t coh, daos_key_t *dkey);
+
 /**
  * Aggregates all epochs within the epoch range \a epr.
  * Data in all these epochs will be aggregated to the last epoch
@@ -605,6 +640,38 @@ enum {
 int
 vos_aggregate(daos_handle_t coh, daos_epoch_range_t *epr,
 	      int (*yield_func)(void *arg), void *yield_arg, uint32_t flags);
+
+/**
+ * Aggregates all epochs within the epoch range \a epr.
+ * Data in all these epochs will be aggregated to the last epoch
+ * \a epr::epr_hi, aggregated epochs will be discarded except the last one,
+ * which is kept as aggregation result.
+ *
+ * This version accepts callbacks for EC parity creation and barrier cleanup,
+ * which avoid circular dependencies between VOS and object modules.
+ *
+ * \param coh	       [IN]	Container open handle
+ * \param epr	       [IN]	The epoch range of aggregation
+ * \param yield_func    [IN]	Pointer to customized yield function
+ * \param yield_arg     [IN]	Argument of yield function
+ * \param ec_parity_cb  [IN]	Callback for EC parity create
+ * \param barrier_cb    [IN]	Callback for barrier cleanup
+ * \param cb_arg        [IN]	Argument for both callbacks
+ * \param oclass_attr   [IN]	Object class attributes for the container.
+ *				Note: It is assumed that all objects in the
+ *				container use the same object class as specified
+ *				by this attribute.
+ * \param flags         [IN]	Aggregation flags
+ *
+ * \return			Zero on success, negative value if error
+ */
+int
+vos_aggregate_with_callbacks(daos_handle_t coh, daos_epoch_range_t *epr,
+			      int (*yield_func)(void *arg), void *yield_arg,
+			      vos_agg_ec_parity_create_t ec_parity_cb,
+			      vos_agg_barrier_cleanup_t barrier_cb,
+			      void *cb_arg, struct daos_oclass_attr *oclass_attr,
+			      uint32_t flags);
 
 /**
  * Discards changes in all epochs with the epoch range \a epr

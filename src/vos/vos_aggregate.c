@@ -11,8 +11,23 @@
 #include <daos_srv/vos.h>
 #include <daos/checksum.h>
 #include <daos_srv/srv_csum.h>
+#include <daos_obj_class.h>
 #include "vos_internal.h"
+#include "vos_agg_barrier.h"
 #include "evt_priv.h"
+
+/* Forward declarations of structs */
+struct agg_merge_window;
+struct vos_agg_param;
+
+/* Forward declarations of functions */
+static int merge_windows_init(struct vos_agg_param *agg_param, daos_epoch_t filter_epoch);
+static void close_all_merge_windows(struct vos_agg_param *agg_param, int rc);
+static int ec_agg_check_and_trigger(struct vos_agg_param *agg_param,
+				    struct agg_merge_window *mw,
+				    vos_iter_entry_t *entry,
+				    bool last,
+				    unsigned int *acts);
 
 unsigned int vos_agg_nvme_thresh = VOS_MW_NVME_THRESH;
 
@@ -143,6 +158,9 @@ struct agg_merge_window {
 	/* I/O context for transferring data on flush */
 	struct agg_io_context		 mw_io_ctxt;
 	uint16_t			 mw_csum_type;
+	/* Barrier boundaries for this window (epoch range) */
+	daos_epoch_t			 mw_barrier_low;
+	daos_epoch_t			 mw_barrier_high;
 	/* Recxs trace for debugging */
 	vos_iter_entry_t		 mw_evt_trace[EV_TRACE_MAX];
 	unsigned int			 mw_trace_start;
@@ -167,13 +185,24 @@ struct vos_agg_param {
 	struct umem_instance	*ap_umm;
 	int			(*ap_yield_func)(void *arg);
 	void			*ap_yield_arg;
+	/* Callbacks for operations that require RPC (implemented in obj module) */
+	vos_agg_ec_parity_create_t	ap_ec_parity_cb;
+	vos_agg_barrier_cleanup_t	ap_barrier_cb;
+	void				*ap_cb_arg;
+	/* Object class attributes passed from caller */
+	struct daos_oclass_attr	*ap_oclass_attr;
+	bool			 ap_is_ec;	/* cached: whether it's EC class */
+	unsigned int		 ap_ec_len;	/* cached: EC e_len */
 	/* SV tree: Max epoch in specified iterate epoch range */
 	daos_epoch_t		 ap_max_epoch;
-	/* EV tree: Merge window for evtree aggregation */
-	struct agg_merge_window	 ap_window;
+	/* EV tree: Merge windows for evtree aggregation */
+	struct agg_merge_window	*ap_windows;
+	unsigned int		 ap_window_cnt;
 	bool			 ap_skip_akey;
 	bool			 ap_skip_dkey;
 	bool			 ap_skip_obj;
+	/* EC full stripe aggregation barriers */
+	struct agg_barriers	 ap_barriers;
 };
 
 static inline void
@@ -403,9 +432,28 @@ static int
 vos_agg_dkey(daos_handle_t ih, vos_iter_entry_t *entry,
 	     struct vos_agg_param *agg_param, unsigned int *acts)
 {
+	int	rc = 0;
+
 	inc_agg_counter(agg_param, VOS_ITER_DKEY, AGG_OP_SCAN);
 
-	return 0;
+	agg_barriers_init(&agg_param->ap_barriers);
+	agg_param->ap_windows = NULL;
+	agg_param->ap_window_cnt = 0;
+
+	if (agg_param->ap_barrier_cb != NULL) {
+		rc = agg_param->ap_barrier_cb(agg_param->ap_cb_arg,
+					       agg_param->ap_oid,
+					       agg_param->ap_coh,
+					       &entry->ie_key);
+		if (rc != 0) {
+			D_ERROR("Failed to cleanup barriers: "DF_RC"\n",
+				DP_RC(rc));
+			/* Non-fatal error, continue with aggregation */
+			rc = 0;
+		}
+	}
+
+	return rc;
 }
 
 static inline bool
@@ -474,7 +522,24 @@ static int
 vos_agg_akey(daos_handle_t ih, vos_iter_entry_t *entry,
 	     struct vos_agg_param *agg_param, unsigned int *acts)
 {
+	int	rc;
+
 	inc_agg_counter(agg_param, VOS_ITER_AKEY, AGG_OP_SCAN);
+
+	if (agg_is_barrier_akey(&entry->ie_key)) {
+		daos_epoch_t	barrier_epoch;
+
+		barrier_epoch = agg_get_barrier_epoch(&entry->ie_key);
+		rc = agg_barriers_add(&agg_param->ap_barriers, barrier_epoch);
+		if (rc != 0) {
+			D_ERROR("Failed to add barrier epoch "DF_U64": "DF_RC"\n",
+				barrier_epoch, DP_RC(rc));
+			return rc;
+		}
+		D_DEBUG(DB_EPC, "Found agg barrier akey with epoch "DF_U64"\n", barrier_epoch);
+
+		return 0;
+	}
 
 	if (agg_param->ap_discard) {
 		/* No merge window for discard path so bypass checks below. */
@@ -483,9 +548,25 @@ vos_agg_akey(daos_handle_t ih, vos_iter_entry_t *entry,
 
 	/* Reset the max epoch for low-level SV tree iteration */
 	agg_param->ap_max_epoch = 0;
-	/* The merge window for EV tree aggregation should have been closed */
-	if (merge_window_status(&agg_param->ap_window) != MW_CLOSED)
-		D_ASSERTF(false, "Merge window isn't closed.\n");
+	/* Initialize merge windows if not done yet (first non-barrier akey) */
+	if (agg_param->ap_windows == NULL && agg_param->ap_barriers.ab_nr > 0) {
+		rc = merge_windows_init(agg_param, agg_param->ap_filter_epoch);
+		if (rc != 0) {
+			D_ERROR("Failed to initialize merge windows: "DF_RC"\n", DP_RC(rc));
+			return rc;
+		}
+		D_DEBUG(DB_EPC, "Initialized %u merge windows for dkey aggregation\n",
+			agg_param->ap_window_cnt);
+	}
+	/* All merge windows for EV tree aggregation should have been closed */
+	if (agg_param->ap_windows != NULL) {
+		unsigned int i;
+
+		for (i = 0; i < agg_param->ap_window_cnt; i++) {
+			if (merge_window_status(&agg_param->ap_windows[i]) != MW_CLOSED)
+				D_ASSERTF(false, "Merge window %u isn't closed.\n", i);
+		}
+	}
 
 	return 0;
 }
@@ -1242,9 +1323,8 @@ out:
 }
 
 static int
-fill_segments(daos_handle_t ih, struct vos_agg_param *agg_param, unsigned int *acts)
+fill_segments(daos_handle_t ih, struct agg_merge_window *mw, struct vos_agg_param *agg_param, unsigned int *acts)
 {
-	struct agg_merge_window	*mw = &agg_param->ap_window;
 	struct agg_io_context	*io = &mw->mw_io_ctxt;
 	struct umem_instance	*umm = agg_param->ap_umm;
 	struct agg_lgc_seg	*lgc_seg;
@@ -1682,9 +1762,8 @@ need_merge(daos_handle_t ih, uint16_t src_media, int lgc_cnt, daos_size_t seg_si
  *    & storage bandwidth, yet likely to generate more fragmentations).
  */
 static bool
-need_flush(daos_handle_t ih, struct vos_agg_param *agg_param, bool last)
+need_flush(daos_handle_t ih, struct agg_merge_window *mw, struct vos_agg_param *agg_param, bool last)
 {
-	struct agg_merge_window	*mw = &agg_param->ap_window;
 	struct agg_phy_ent	*phy_ent;
 	struct agg_lgc_ent	*lgc_ent;
 	struct evt_extent	 lgc_ext, phy_ext;
@@ -1753,12 +1832,11 @@ need_flush(daos_handle_t ih, struct vos_agg_param *agg_param, bool last)
 
 static int
 flush_merge_window(daos_handle_t ih, struct vos_agg_param *agg_param,
-		   bool last, unsigned int *acts)
+		   struct agg_merge_window *mw, bool last, unsigned int *acts)
 {
-	struct agg_merge_window	*mw = &agg_param->ap_window;
 	int			 rc;
 
-	if (!need_flush(ih, agg_param, last))
+	if (!need_flush(ih, mw, agg_param, last))
 		return 0;
 
 	D_DEBUG(DB_TRACE, "Flush to merge to window "DF_EXT"\n", DP_EXT(&mw->mw_ext));
@@ -1772,7 +1850,7 @@ flush_merge_window(daos_handle_t ih, struct vos_agg_param *agg_param,
 	}
 
 	/* Transfer data from old logical records to reserved new segments */
-	rc = fill_segments(ih, agg_param, acts);
+	rc = fill_segments(ih, mw, agg_param, acts);
 	if (rc) {
 		DL_CDEBUG(rc == -DER_NOSPACE, DB_EPC, DLOG_ERR, rc,
 			  "Fill segments " DF_EXT " error", DP_EXT(&mw->mw_ext));
@@ -1961,6 +2039,22 @@ close_merge_window(struct agg_merge_window *mw, int rc)
 	mw->mw_trace_count = 0;
 }
 
+static void
+close_all_merge_windows(struct vos_agg_param *agg_param, int rc)
+{
+	unsigned int i;
+
+	if (agg_param->ap_windows == NULL)
+		return;
+
+	for (i = 0; i < agg_param->ap_window_cnt; i++) {
+		close_merge_window(&agg_param->ap_windows[i], rc);
+	}
+	D_FREE(agg_param->ap_windows);
+	agg_param->ap_windows = NULL;
+	agg_param->ap_window_cnt = 0;
+}
+
 static struct agg_phy_ent *
 lookup_phy_ent(struct agg_merge_window *mw, const struct evt_extent *phy_ext,
 	       const vos_iter_entry_t *entry)
@@ -2013,13 +2107,13 @@ mark_removals(struct agg_merge_window *mw, struct agg_phy_ent *phy_ent,
 
 static int
 join_merge_window(daos_handle_t ih, struct vos_agg_param *agg_param,
-		  vos_iter_entry_t *entry, unsigned int *acts)
+		  struct agg_merge_window *mw, vos_iter_entry_t *entry,
+		  unsigned int *acts)
 {
 	struct vos_obj_iter	*oiter = vos_hdl2oiter(ih);
-	struct agg_merge_window	*mw = &agg_param->ap_window;
 	struct evt_extent	 phy_ext, lgc_ext;
 	struct agg_phy_ent	*phy_ent;
-	bool			 remove, visible, partial, last;
+	bool			 remove, visible, partial;
 	int			 rc = 0;
 
 	recx2ext(&entry->ie_recx, &lgc_ext);
@@ -2069,7 +2163,6 @@ join_merge_window(daos_handle_t ih, struct vos_agg_param *agg_param,
 	visible = (entry->ie_vis_flags & VOS_VIS_FLAG_VISIBLE);
 	remove = (entry->ie_vis_flags & VOS_VIS_FLAG_REMOVE);
 	partial = (entry->ie_vis_flags & VOS_VIS_FLAG_PARTIAL);
-	last = (entry->ie_vis_flags & VOS_VIS_FLAG_LAST);
 
 	/* Just delete the fully covered intact physical entry */
 	if (!visible && !partial && !remove) {
@@ -2101,7 +2194,7 @@ join_merge_window(daos_handle_t ih, struct vos_agg_param *agg_param,
 	if (visible && trigger_flush(mw, &lgc_ext)) {
 		/* The window flush doesn't expect holes caused by removal records */
 		mw->mw_ext.ex_hi = lgc_ext.ex_lo - 1;
-		rc = flush_merge_window(ih, agg_param, false, acts);
+		rc = flush_merge_window(ih, agg_param, mw, false, acts);
 		if (rc) {
 			DL_CDEBUG(rc == -DER_NOSPACE, DB_EPC, DLOG_ERR, rc,
 				  "Flush window " DF_EXT " error", DP_EXT(&mw->mw_ext));
@@ -2153,15 +2246,77 @@ join_merge_window(daos_handle_t ih, struct vos_agg_param *agg_param,
 		mark_removals(mw, phy_ent, &lgc_ext);
 	}
 out:
-	/* Flush & close window on last entry */
-	if (last) {
-		rc = flush_merge_window(ih, agg_param, true, acts);
-		if (rc)
-			DL_CDEBUG(rc == -DER_NOSPACE, DB_EPC, DLOG_ERR, rc,
-				  "Flush window " DF_EXT " error", DP_EXT(&mw->mw_ext));
+	return rc;
+}
 
-		close_merge_window(mw, rc);
+static int
+ec_agg_check_and_trigger(struct vos_agg_param *agg_param,
+			 struct agg_merge_window *mw,
+			 vos_iter_entry_t *entry,
+			 bool last,
+			 unsigned int *acts)
+{
+	daos_epoch_t			 now;
+	daos_epoch_t			 merge_window_start;
+	daos_epoch_t			 latest_recx_epoch = 0;
+	uint64_t			 covered = 0;
+	bool				 has_full_stripe = false;
+	bool				 is_scattered_timeout = false;
+	int				 rc = 0;
+
+	if (!agg_param->ap_is_ec)
+		return 0;
+
+	if (!last)
+		return 0;
+
+	/* Skip if there's no EC parity callback */
+	if (agg_param->ap_ec_parity_cb == NULL)
+		return 0;
+
+	// Skip if there are too many logical entries
+	// if (mw->mw_lgc_cnt > MW_MAX_MERGE_CNT)
+	//	return 0;
+
+	for (uint32_t i = 0; i < mw->mw_lgc_cnt; i++) {
+		struct agg_phy_ent	*phy_ent = mw->mw_lgc_ents[i].le_phy_ent;
+		struct evt_extent	*lgc_ext = &mw->mw_lgc_ents[i].le_ext;
+
+		if (phy_ent != NULL && phy_ent->pe_rect.rc_epc > latest_recx_epoch)
+			latest_recx_epoch = phy_ent->pe_rect.rc_epc;
+
+		covered += (uint64_t)(lgc_ext->ex_hi - lgc_ext->ex_lo + 1);
 	}
+
+	if (agg_param->ap_barriers.ab_nr > 0)
+		merge_window_start = agg_param->ap_barriers.ab_epochs[
+			agg_param->ap_barriers.ab_nr - 1];
+	else
+		merge_window_start = 0;
+
+	if (latest_recx_epoch <= merge_window_start)
+		return 0;
+
+	now = daos_gettime_coarse();
+
+	has_full_stripe = (covered >= agg_param->ap_ec_len);
+
+	if (!has_full_stripe)
+		is_scattered_timeout = (now - latest_recx_epoch) >= 600;
+
+	if (!has_full_stripe && !is_scattered_timeout)
+		return 0;
+
+	D_DEBUG(DB_EPC, "EC聚合触发: has_full_stripe=%d, scattered_timeout=%d, latest_epoch="DF_U64"\n",
+		has_full_stripe, is_scattered_timeout, latest_recx_epoch);
+
+	rc = agg_param->ap_ec_parity_cb(agg_param->ap_cb_arg,
+					 merge_window_start,
+					 &entry->ie_key,
+					 agg_param->ap_oid,
+					 agg_param->ap_coh);
+	if (rc == 0)
+		*acts |= VOS_ITER_CB_SKIP;
 
 	return rc;
 }
@@ -2231,13 +2386,29 @@ static int
 vos_agg_ev(daos_handle_t ih, vos_iter_entry_t *entry,
 	   struct vos_agg_param *agg_param, unsigned int *acts)
 {
-	struct agg_merge_window	*mw = &agg_param->ap_window;
+	struct agg_merge_window	*mw;
 	struct evt_extent	 phy_ext, lgc_ext;
 	int			 rc = 0;
 	struct vos_container	*cont = vos_hdl2cont(agg_param->ap_coh);
+	unsigned int		 i;
 
 	D_ASSERT(agg_param != NULL);
 	D_ASSERT(acts != NULL);
+	D_ASSERT(agg_param->ap_windows != NULL);
+
+	/* Find the merge window for this extent based on its epoch */
+	mw = NULL;
+	for (i = 0; i < agg_param->ap_window_cnt; i++) {
+		if (entry->ie_epoch <= agg_param->ap_windows[i].mw_barrier_high) {
+			mw = &agg_param->ap_windows[i];
+			break;
+		}
+	}
+	if (mw == NULL) {
+		/* Epoch is beyond all barriers, use the last window */
+		mw = &agg_param->ap_windows[agg_param->ap_window_cnt - 1];
+	}
+
 	recx2ext(&entry->ie_recx, &lgc_ext);
 	recx2ext(&entry->ie_orig_recx, &phy_ext);
 
@@ -2283,11 +2454,34 @@ vos_agg_ev(daos_handle_t ih, vos_iter_entry_t *entry,
 	if (rc)
 		goto out;
 
-	rc = join_merge_window(ih, agg_param, entry, acts);
+	rc = join_merge_window(ih, agg_param, mw, entry, acts);
 	if (rc)
 		DL_CDEBUG(rc == -DER_TX_RESTART || rc == -DER_TX_BUSY || rc == -DER_NOSPACE,
 			  DB_TRACE, DLOG_ERR, rc, "Join window " DF_EXT "/" DF_EXT " error",
 			  DP_EXT(&mw->mw_ext), DP_EXT(&phy_ext));
+
+	/* Flush & close all windows on last entry */
+	if (entry->ie_vis_flags & VOS_VIS_FLAG_LAST) {
+		for (i = 0; i < agg_param->ap_window_cnt; i++) {
+			struct agg_merge_window	*wm = &agg_param->ap_windows[i];
+			int			 trc;
+
+			trc = ec_agg_check_and_trigger(agg_param, wm, entry, true, acts);
+			if (trc != 0 || (*acts & VOS_ITER_CB_SKIP)) {
+				*acts &= ~VOS_ITER_CB_SKIP;
+				rc = trc != 0 ? trc : rc;
+				continue;
+			}
+
+			trc = flush_merge_window(ih, agg_param, wm, true, acts);
+			if (trc)
+				DL_CDEBUG(trc == -DER_NOSPACE, DB_EPC, DLOG_ERR, trc,
+					  "Flush window %u error", i);
+
+			close_merge_window(wm, trc);
+		}
+	}
+
 out:
 	if (rc)
 		close_merge_window(mw, rc);
@@ -2416,6 +2610,8 @@ vos_aggregate_post_cb(daos_handle_t ih, vos_iter_entry_t *entry,
 			agg_param->ap_skip_dkey = false;
 			break;
 		}
+		close_all_merge_windows(agg_param, rc);
+		agg_barriers_fini(&agg_param->ap_barriers);
 	case VOS_ITER_AKEY:
 		if (agg_param->ap_skip_akey) {
 			agg_param->ap_skip_akey = false;
@@ -2623,6 +2819,45 @@ merge_window_init(struct agg_merge_window *mw)
 	D_INIT_LIST_HEAD(&io->ic_nvme_exts);
 }
 
+static int
+merge_windows_init(struct vos_agg_param *agg_param, daos_epoch_t filter_epoch)
+{
+	struct agg_merge_window	*windows;
+	unsigned int		 window_cnt;
+	unsigned int		 i;
+	daos_epoch_t		 prev_epoch = 0;
+	daos_epoch_t		 curr_epoch;
+	int			 rc = 0;
+
+	window_cnt = agg_param->ap_barriers.ab_nr + 1;
+	D_ALLOC_ARRAY(windows, window_cnt);
+	if (windows == NULL)
+		return -DER_NOMEM;
+
+	for (i = 0; i < window_cnt; i++) {
+		merge_window_init(&windows[i]);
+
+		if (i < agg_param->ap_barriers.ab_nr) {
+			curr_epoch = agg_param->ap_barriers.ab_epochs[i];
+		} else {
+			curr_epoch = filter_epoch;
+		}
+
+		windows[i].mw_barrier_low = prev_epoch;
+		windows[i].mw_barrier_high = curr_epoch;
+
+		D_DEBUG(DB_EPC, "Init window %u: epoch range (%"PRIu64", %"PRIu64"]\n",
+			i, windows[i].mw_barrier_low, windows[i].mw_barrier_high);
+
+		prev_epoch = curr_epoch;
+	}
+
+	agg_param->ap_windows = windows;
+	agg_param->ap_window_cnt = window_cnt;
+
+	return rc;
+}
+
 struct agg_data {
 	vos_iter_param_t	ad_iter_param;
 	struct vos_agg_param	ad_agg_param;
@@ -2642,8 +2877,12 @@ vos_aggregate_exit(daos_handle_t coh)
 }
 
 int
-vos_aggregate(daos_handle_t coh, daos_epoch_range_t *epr,
-	      int (*yield_func)(void *arg), void *yield_arg, uint32_t flags)
+vos_aggregate_with_callbacks(daos_handle_t coh, daos_epoch_range_t *epr,
+			      int (*yield_func)(void *arg), void *yield_arg,
+			      vos_agg_ec_parity_create_t ec_parity_cb,
+			      vos_agg_barrier_cleanup_t barrier_cb,
+			      void *cb_arg, struct daos_oclass_attr *oclass_attr,
+			      uint32_t flags)
 {
 	struct vos_container	*cont = vos_hdl2cont(coh);
 	struct vos_agg_metrics  *vam  = agg_cont2metrics(cont);
@@ -2704,8 +2943,20 @@ vos_aggregate(daos_handle_t coh, daos_epoch_range_t *epr,
 	ad->ad_agg_param.ap_discard = 0;
 	ad->ad_agg_param.ap_yield_func = yield_func;
 	ad->ad_agg_param.ap_yield_arg = yield_arg;
+	ad->ad_agg_param.ap_ec_parity_cb = ec_parity_cb;
+	ad->ad_agg_param.ap_barrier_cb = barrier_cb;
+	ad->ad_agg_param.ap_cb_arg = cb_arg;
+	ad->ad_agg_param.ap_oclass_attr = oclass_attr;
+	ad->ad_agg_param.ap_is_ec = false;
+	ad->ad_agg_param.ap_ec_len = 0;
+	if (oclass_attr != NULL) {
+		ad->ad_agg_param.ap_is_ec = (oclass_attr->ca_resil == DAOS_RES_EC);
+		if (ad->ad_agg_param.ap_is_ec)
+			ad->ad_agg_param.ap_ec_len = oclass_attr->u.ec.e_len;
+	}
 	run_agg = true;
-	merge_window_init(&ad->ad_agg_param.ap_window);
+	ad->ad_agg_param.ap_windows = NULL;
+	ad->ad_agg_param.ap_window_cnt = 0;
 	ad->ad_agg_param.ap_flags = flags;
 
 	ad->ad_iter_param.ip_flags |= VOS_IT_FOR_PURGE | VOS_IT_FOR_AGG;
@@ -2723,16 +2974,15 @@ retry:
 		/** Warn once if it goes over 20 times */
 		D_CDEBUG(blocks == 20, DLOG_WARN, DB_EPC,
 			 "VOS aggrregation hit conflict (nr=%d), retrying...\n", blocks);
-		close_merge_window(&ad->ad_agg_param.ap_window, rc);
+		close_all_merge_windows(&ad->ad_agg_param, rc);
 		vos_aggregate_yield(&ad->ad_agg_param);
 		goto retry;
 	} else if (rc != 0 || ad->ad_agg_param.ap_nospc_err) {
-		close_merge_window(&ad->ad_agg_param.ap_window, rc);
+		close_all_merge_windows(&ad->ad_agg_param, rc);
 		goto exit;
 	} else if (ad->ad_agg_param.ap_csum_err) {
-		rc = -DER_CSUM;	/* Inform caller the csum error */
-		close_merge_window(&ad->ad_agg_param.ap_window, rc);
-		/* HAE needs be updated for csum error case */
+		rc = -DER_CSUM;
+		close_all_merge_windows(&ad->ad_agg_param, rc);
 	} else if (ad->ad_agg_param.ap_in_progress) {
 		/* Don't update HAE when there were in-progress entries. Otherwise,
 		 * we will never aggregate anything in those subtrees until there is
@@ -2754,8 +3004,14 @@ update_hae:
 exit:
 	aggregate_exit(cont, AGG_MODE_AGGREGATE);
 
-	if (run_agg && merge_window_status(&ad->ad_agg_param.ap_window) != MW_CLOSED)
-		D_ASSERTF(false, "Merge window resource leaked.\n");
+	if (run_agg && ad->ad_agg_param.ap_windows != NULL) {
+		unsigned int i;
+
+		for (i = 0; i < ad->ad_agg_param.ap_window_cnt; i++) {
+			if (merge_window_status(&ad->ad_agg_param.ap_windows[i]) != MW_CLOSED)
+				D_ASSERTF(false, "Merge window %u resource leaked.\n", i);
+		}
+	}
 
 free_agg_data:
 	D_FREE(ad);
@@ -2766,6 +3022,14 @@ free_agg_data:
 	}
 
 	return rc;
+}
+
+int
+vos_aggregate(daos_handle_t coh, daos_epoch_range_t *epr,
+	      int (*yield_func)(void *arg), void *yield_arg, uint32_t flags)
+{
+	return vos_aggregate_with_callbacks(coh, epr, yield_func, yield_arg,
+					   NULL, NULL, NULL, NULL, flags);
 }
 
 int

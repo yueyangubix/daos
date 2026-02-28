@@ -657,7 +657,6 @@ obj_ec_recx_encode(struct obj_ec_codec *codec, struct daos_oclass_attr *oca,
 			last_off += stripe_bytes;
 		}
 	}
-
 out:
 	return rc;
 }
@@ -1695,6 +1694,7 @@ obj_ec_req_reasb(struct dc_object *obj, daos_iod_t *iods, uint64_t dkey_hash, d_
 		 struct obj_reasb_req *reasb_req, uint32_t iod_nr, bool update)
 {
 	bool	singv_only = true;
+	bool	any_full_stripe = false;
 	int	i, j, rc = 0;
 	int	data_tgt_nr = 0;
 
@@ -1754,6 +1754,9 @@ obj_ec_req_reasb(struct dc_object *obj, daos_iod_t *iods, uint64_t dkey_hash, d_
 				DP_OID(obj->cob_md.omd_id), rc);
 			goto out;
 		}
+
+		if (update && reasb_req->orr_recxs[i].oer_stripe_total > 0)
+			any_full_stripe = true;
 	}
 
 	for (i = 0; !reasb_req->orr_size_fetched && i < obj_ec_tgt_nr(obj_get_oca(obj)); i++) {
@@ -1814,6 +1817,7 @@ obj_ec_req_reasb(struct dc_object *obj, daos_iod_t *iods, uint64_t dkey_hash, d_
 		}
 	}
 
+	reasb_req->orr_add_barrier = any_full_stripe && update;
 out:
 	return rc;
 }

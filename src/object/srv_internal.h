@@ -276,6 +276,9 @@ void ds_obj_ec_agg_handler(crt_rpc_t *rpc);
 void ds_obj_ec_rep_handler(crt_rpc_t *rpc);
 void ds_obj_cpd_handler(crt_rpc_t *rpc);
 void ds_obj_coll_punch_handler(crt_rpc_t *rpc);
+void ds_obj_agg_barrier_handler(crt_rpc_t *rpc);
+void ds_obj_barrier_state_query_handler(crt_rpc_t *rpc);
+void ds_obj_ec_parity_handler(crt_rpc_t *rpc);
 typedef int (*ds_iofw_cb_t)(crt_rpc_t *req, void *arg);
 
 int
@@ -581,5 +584,10 @@ fill_oid(daos_unit_oid_t oid, struct ds_obj_enum_arg *arg);
 /* srv_ec.c */
 struct obj_rw_in;
 void obj_ec_metrics_process(struct obj_iod_array *iod_array, struct obj_io_context *ioc);
+
+/* srv_ec_parity.c */
+int
+ec_parity_create(daos_epoch_t barrier_epoch, daos_key_t *dkey,
+		 daos_unit_oid_t oid, daos_handle_t coh);
 
 #endif /* __DAOS_OBJ_SRV_INTENRAL_H__ */

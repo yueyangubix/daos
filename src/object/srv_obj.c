@@ -30,6 +30,7 @@
 #include <daos_srv/srv_csum.h>
 #include "obj_rpc.h"
 #include "srv_internal.h"
+#include <daos_srv/agg_barrier.h>
 
 static int
 obj_verify_bio_csum(daos_obj_id_t oid, daos_iod_t *iods,
@@ -2588,6 +2589,178 @@ out_agg:
 out:
 	obj_rw_reply(rpc, rc, 0, false, &ioc);
 	obj_ioc_end(&ioc, rc);
+}
+
+void
+ds_obj_agg_barrier_handler(crt_rpc_t *rpc)
+{
+	struct obj_agg_barrier_in	*ab_in = crt_req_get(rpc);
+	struct obj_agg_barrier_out	*ab_out = crt_reply_get(rpc);
+	struct obj_io_context		 ioc;
+	daos_handle_t			 ioh = DAOS_HDL_INVAL;
+	daos_iod_t			 barrier_iod = { 0 };
+	d_sg_list_t			 barrier_sgl = { 0 };
+	d_iov_t				 barrier_iov = { 0 };
+	daos_key_t			 barrier_akey;
+	char				 barrier_akey_name[64];
+	int				 rc;
+
+	D_ASSERT(ab_in != NULL);
+	D_ASSERT(ab_out != NULL);
+
+	rc = obj_ioc_begin(ab_in->ab_oid.id_pub, ab_in->ab_map_ver,
+			   ab_in->ab_pool_uuid, ab_in->ab_coh_uuid,
+			   ab_in->ab_cont_uuid, rpc, 0, &ioc);
+	if (rc) {
+		D_ERROR("ioc_begin failed: "DF_RC"\n", DP_RC(rc));
+		goto out;
+	}
+
+	if (!daos_oclass_is_ec(&ioc.ioc_oca)) {
+		rc = -DER_PROTO;
+		goto out;
+	}
+
+	snprintf(barrier_akey_name, sizeof(barrier_akey_name), "_agg_barrier_"DF_U64,
+		 ab_in->ab_barrier_epoch);
+
+	d_iov_set(&barrier_akey, barrier_akey_name, strlen(barrier_akey_name));
+
+	barrier_iod.iod_name  = barrier_akey;
+	barrier_iod.iod_type  = DAOS_IOD_SINGLE;
+	barrier_iod.iod_size  = 0;
+	barrier_iod.iod_nr    = 1;
+	barrier_iod.iod_recxs = NULL;
+
+	d_iov_set(&barrier_iov, NULL, 0);
+	barrier_sgl.sg_nr = barrier_sgl.sg_nr_out = 1;
+	barrier_sgl.sg_iovs = &barrier_iov;
+
+	rc = vos_update_begin(ioc.ioc_coc->sc_hdl, ab_in->ab_oid,
+			      ab_in->ab_barrier_epoch, VOS_OF_REBUILD,
+			      &ab_in->ab_dkey, 1, &barrier_iod, NULL, 0,
+			      &ioh, NULL);
+	if (rc) {
+		D_ERROR(DF_UOID" vos_update_begin failed: "DF_RC"\n",
+			DP_UOID(ab_in->ab_oid), DP_RC(rc));
+		goto out_ioc;
+	}
+
+	rc = vos_update_end(ioh, ioc.ioc_map_ver, &barrier_akey, rc,
+			   &ioc.ioc_io_size, NULL);
+	if (rc)
+		D_ERROR(DF_UOID" vos_update_end failed: "DF_RC"\n",
+			DP_UOID(ab_in->ab_oid), DP_RC(rc));
+
+out_ioc:
+	obj_ioc_end(&ioc, rc);
+out:
+	ab_out->ab_status = rc;
+	ab_out->ab_map_ver = ioc.ioc_map_ver;
+	obj_rw_reply(rpc, rc, 0, false, &ioc);
+}
+
+void
+ds_obj_barrier_state_query_handler(crt_rpc_t *rpc)
+{
+	struct obj_barrier_state_query_in	*bsq_in = crt_req_get(rpc);
+	struct obj_barrier_state_query_out	*bsq_out = crt_reply_get(rpc);
+	struct obj_io_context			 ioc;
+	// daos_handle_t				 ioh = DAOS_HDL_INVAL;
+	// daos_iod_t				 barrier_iod = { 0 };
+	// d_sg_list_t				 barrier_sgl = { 0 };
+	// d_iov_t					 barrier_iov = { 0 };
+	// daos_key_t				 barrier_akey;
+	// char					 barrier_akey_name[64];
+	enum barrier_state			 state = BARRIER_STATE_ACTIVE;
+	bool					 has_newer;
+	bool					 has_parity;
+	int					 rc;
+
+	D_ASSERT(bsq_in != NULL);
+	D_ASSERT(bsq_out != NULL);
+
+	rc = obj_ioc_begin(bsq_in->bsq_oid.id_pub, bsq_in->bsq_map_ver,
+			   bsq_in->bsq_pool_uuid, bsq_in->bsq_coh_uuid,
+			   bsq_in->bsq_cont_uuid, rpc, 0, &ioc);
+	if (rc) {
+		D_ERROR("ioc_begin failed: "DF_RC"\n", DP_RC(rc));
+		goto out;
+	}
+
+	if (!daos_oclass_is_ec(&ioc.ioc_oca)) {
+		rc = -DER_PROTO;
+		goto out_ioc;
+	}
+
+	state = BARRIER_STATE_ACTIVE;
+
+	if (bsq_in->bsq_is_parity) {
+		has_newer = barrier_has_newer(bsq_in->bsq_oid, &bsq_in->bsq_dkey,
+					      ioc.ioc_coc->sc_hdl,
+					      bsq_in->bsq_barrier_epoch);
+		if (has_newer) {
+			has_parity = barrier_has_newer_parity(bsq_in->bsq_oid,
+							      &bsq_in->bsq_dkey,
+							      ioc.ioc_coc->sc_hdl,
+							      bsq_in->bsq_barrier_epoch);
+			if (has_parity)
+				state = BARRIER_STATE_LOCAL_STALE;
+		}
+	} else {
+		has_newer = barrier_has_newer(bsq_in->bsq_oid, &bsq_in->bsq_dkey,
+					      ioc.ioc_coc->sc_hdl,
+					      bsq_in->bsq_barrier_epoch);
+		if (has_newer)
+			state = BARRIER_STATE_LOCAL_STALE;
+	}
+
+out_ioc:
+	obj_ioc_end(&ioc, rc);
+out:
+	bsq_out->bsq_status = rc;
+	bsq_out->bsq_state = state;
+	bsq_out->bsq_map_ver = ioc.ioc_map_ver;
+	obj_rw_reply(rpc, rc, 0, false, &ioc);
+}
+
+void
+ds_obj_ec_parity_handler(crt_rpc_t *rpc)
+{
+	struct obj_ec_parity_in	*ep_in = crt_req_get(rpc);
+	struct obj_ec_parity_out	*ep_out = crt_reply_get(rpc);
+	struct obj_io_context		 ioc;
+	int				 rc;
+
+	D_ASSERT(ep_in != NULL);
+	D_ASSERT(ep_out != NULL);
+
+	rc = obj_ioc_begin(ep_in->ep_oid.id_pub, ep_in->ep_map_ver,
+			   ep_in->ep_pool_uuid, ep_in->ep_coh_uuid,
+			   ep_in->ep_cont_uuid, rpc, 0, &ioc);
+	if (rc) {
+		D_ERROR("ioc_begin failed: "DF_RC"\n", DP_RC(rc));
+		goto out;
+	}
+
+	if (!daos_oclass_is_ec(&ioc.ioc_oca)) {
+		rc = -DER_PROTO;
+		goto out_ioc;
+	}
+
+	rc = ec_parity_create(ep_in->ep_barrier_epoch, &ep_in->ep_dkey,
+			     ep_in->ep_oid, ioc.ioc_coc->sc_hdl);
+	if (rc) {
+		D_ERROR("ec_parity_create failed: "DF_RC"\n", DP_RC(rc));
+		goto out_ioc;
+	}
+
+out_ioc:
+	obj_ioc_end(&ioc, rc);
+out:
+	ep_out->ep_status = rc;
+	ep_out->ep_map_ver = ioc.ioc_map_ver;
+	obj_rw_reply(rpc, rc, 0, false, &ioc);
 }
 
 void

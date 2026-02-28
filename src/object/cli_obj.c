@@ -993,6 +993,7 @@ obj_reasb_req_fini(struct obj_reasb_req *reasb_req, uint32_t iod_nr)
 	}
 	D_MUTEX_DESTROY(&reasb_req->orr_mutex);
 	obj_ec_fail_info_free(reasb_req);
+	D_FREE(reasb_req->orr_barrier_akey);
 	D_FREE(reasb_req->orr_iods);
 	memset(reasb_req, 0, sizeof(*reasb_req));
 }
@@ -6182,6 +6183,62 @@ out:
 }
 
 static int
+obj_ec_add_barrier_iod(struct dc_object *obj, daos_obj_rw_t *args,
+		       struct dtx_epoch *epoch, struct obj_auxi_args *obj_auxi)
+{
+	daos_iod_t		*new_iods;
+	d_sg_list_t		*new_sgls;
+	daos_key_t		*akey;
+	char			*akey_name;
+	struct obj_reasb_req	*reasb_req = &obj_auxi->reasb_req;
+	int			 nr = args->nr;
+	int			 rc = 0;
+
+	D_REALLOC_ARRAY(new_iods, args->iods, nr, nr + 1);
+	if (new_iods == NULL) {
+		D_ERROR(DF_OID" Failed to allocate memory for barrier IOD.\n",
+			DP_OID(obj->cob_md.omd_id));
+		return -DER_NOMEM;
+	}
+	args->iods = new_iods;
+
+	if (args->sgls != NULL) {
+		D_ALLOC_ARRAY(new_sgls, nr + 1);
+		if (new_sgls == NULL) {
+			D_ERROR(DF_OID" Failed to allocate memory for barrier SGL.\n",
+				DP_OID(obj->cob_md.omd_id));
+			return -DER_NOMEM;
+		}
+		memcpy(new_sgls, args->sgls, nr * sizeof(d_sg_list_t));
+		if (obj_auxi->req_reasbed && obj_auxi->is_ec_obj)
+			reasb_req->orr_usgls = new_sgls;
+		args->sgls = new_sgls;
+		d_sgl_init(&new_sgls[nr], 0);
+	}
+
+	D_ALLOC(akey_name, 40);
+	if (akey_name == NULL) {
+		D_ERROR(DF_OID" Failed to allocate memory for barrier akey name.\n",
+			DP_OID(obj->cob_md.omd_id));
+		return -DER_NOMEM;
+	}
+	snprintf(akey_name, 40, "_agg_barrier_"DF_U64, epoch->oe_value);
+	reasb_req->orr_barrier_akey = akey_name;
+	akey = &new_iods[nr].iod_name;
+	d_iov_set(akey, akey_name, strlen(akey_name));
+
+	new_iods[nr].iod_type = DAOS_IOD_SINGLE;
+	new_iods[nr].iod_size = 0;
+	new_iods[nr].iod_nr = 1;
+	new_iods[nr].iod_recxs = NULL;
+	new_iods[nr].iod_flags = 0;
+
+	args->nr = nr + 1;
+
+	return rc;
+}
+
+static int
 dc_obj_update(tse_task_t *task, struct dtx_epoch *epoch, uint32_t map_ver,
 	      daos_obj_update_t *args, struct dc_object *obj)
 {
@@ -6272,6 +6329,12 @@ dc_obj_update(tse_task_t *task, struct dtx_epoch *epoch, uint32_t map_ver,
 
 	D_DEBUG(DB_IO, "update "DF_OID" dkey_hash "DF_U64"\n",
 		DP_OID(obj->cob_md.omd_id), obj_auxi->dkey_hash);
+
+	if (obj_auxi->reasb_req.orr_add_barrier) {
+		rc = obj_ec_add_barrier_iod(obj, args, epoch, obj_auxi);
+		if (rc != 0)
+			D_GOTO(out_task, rc);
+	}
 
 	rc = obj_rw_bulk_prep(obj, args->iods, args->sgls, args->nr, true,
 			      obj_auxi->req_tgts.ort_srv_disp, task, obj_auxi);

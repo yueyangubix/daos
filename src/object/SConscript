@@ -36,7 +36,8 @@ def scons():
                                         'srv_obj_remote.c', 'srv_ec.c',
                                         'srv_obj_migrate.c', 'srv_enum.c',
                                         'srv_cli.c', 'srv_ec_aggregate.c',
-                                        'srv_csum.c', 'srv_io_map.c'],
+                                        'srv_csum.c', 'srv_io_map.c',
+                                        'srv_ec_parity.c', 'agg_barrier.c'],
                          install_off="../..")
     senv.Install('$PREFIX/lib64/daos_srv', srv)
 

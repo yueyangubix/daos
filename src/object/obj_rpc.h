@@ -93,6 +93,15 @@
 	X(DAOS_OBJ_RPC_EC_REPLICATE,					\
 		0, &CQF_obj_ec_rep,					\
 		ds_obj_ec_rep_handler, NULL, "ec_rep")			\
+	X(DAOS_OBJ_RPC_AGG_BARRIER,					\
+		0, &CQF_obj_agg_barrier,				\
+		ds_obj_agg_barrier_handler, NULL, "agg_barrier")	\
+	X(DAOS_OBJ_RPC_BARRIER_STATE_QUERY,				\
+		0, &CQF_obj_barrier_state_query,			\
+		ds_obj_barrier_state_query_handler, NULL, "barrier_state_query")	\
+	X(DAOS_OBJ_RPC_EC_PARITY,					\
+		0, &CQF_obj_ec_parity,					\
+		ds_obj_ec_parity_handler, NULL, "ec_parity")		\
 	X(DAOS_OBJ_RPC_CPD,						\
 		0, &CQF_obj_cpd,					\
 		ds_obj_cpd_handler, NULL, "compound")			\
@@ -467,6 +476,65 @@ CRT_RPC_DECLARE(obj_ec_agg, DAOS_ISEQ_OBJ_EC_AGG, DAOS_OSEQ_OBJ_EC_AGG)
 	((struct daos_req_comm_out) (er_comm_out)	CRT_VAR)
 
 CRT_RPC_DECLARE(obj_ec_rep, DAOS_ISEQ_OBJ_EC_REP, DAOS_OSEQ_OBJ_EC_REP)
+
+#define DAOS_ISEQ_OBJ_AGG_BARRIER /* input fields */                  \
+	((uuid_t)         (ab_pool_uuid)      CRT_VAR)                    \
+	((uuid_t)         (ab_cont_uuid)      CRT_VAR)                    \
+	((uuid_t)         (ab_poh_uuid)       CRT_VAR)                    \
+	((uuid_t)         (ab_coh_uuid)       CRT_VAR)                    \
+	((daos_unit_oid_t)(ab_oid)            CRT_VAR)                    \
+	((daos_key_t)     (ab_dkey)           CRT_VAR)                    \
+	((uint64_t)       (ab_barrier_epoch)  CRT_VAR)                    \
+	((uint32_t)       (ab_map_ver)        CRT_VAR)                    \
+	((uint32_t)       (ab_padding)        CRT_VAR)                    \
+	((struct daos_req_comm_in) (ab_comm_in) CRT_VAR)
+
+#define DAOS_OSEQ_OBJ_AGG_BARRIER /* output fields */                 \
+	((int32_t)        (ab_status)         CRT_VAR)                    \
+	((uint32_t)       (ab_map_ver)        CRT_VAR)                    \
+	((struct daos_req_comm_out) (ab_comm_out) CRT_VAR)
+
+CRT_RPC_DECLARE(obj_agg_barrier, DAOS_ISEQ_OBJ_AGG_BARRIER, DAOS_OSEQ_OBJ_AGG_BARRIER)
+
+#define DAOS_ISEQ_OBJ_BARRIER_STATE_QUERY /* input fields */            \
+	((uuid_t)         (bsq_pool_uuid)     CRT_VAR)                    \
+	((uuid_t)         (bsq_cont_uuid)     CRT_VAR)                    \
+	((uuid_t)         (bsq_coh_uuid)      CRT_VAR)                    \
+	((daos_unit_oid_t)(bsq_oid)           CRT_RAW)                    \
+	((daos_key_t)     (bsq_dkey)          CRT_VAR)                    \
+	((uint64_t)       (bsq_barrier_epoch) CRT_VAR)                    \
+	((uint32_t)       (bsq_map_ver)       CRT_VAR)                    \
+	((uint32_t)       (bsq_is_parity)     CRT_VAR)                    \
+	((struct daos_req_comm_in) (bsq_comm_in) CRT_VAR)
+
+#define DAOS_OSEQ_OBJ_BARRIER_STATE_QUERY /* output fields */           \
+	((int32_t)        (bsq_status)        CRT_VAR)                   \
+	((uint32_t)       (bsq_state)         CRT_VAR)                   \
+	((uint32_t)       (bsq_map_ver)       CRT_VAR)                   \
+	((uint32_t)       (bsq_padding)       CRT_VAR)                   \
+	((struct daos_req_comm_out) (bsq_comm_out) CRT_VAR)
+
+CRT_RPC_DECLARE(obj_barrier_state_query, DAOS_ISEQ_OBJ_BARRIER_STATE_QUERY,
+		DAOS_OSEQ_OBJ_BARRIER_STATE_QUERY)
+
+#define DAOS_ISEQ_OBJ_EC_PARITY /* input fields */                   \
+	((uuid_t)         (ep_pool_uuid)      CRT_VAR)                    \
+	((uuid_t)         (ep_cont_uuid)      CRT_VAR)                    \
+	((uuid_t)         (ep_poh_uuid)       CRT_VAR)                    \
+	((uuid_t)         (ep_coh_uuid)       CRT_VAR)                    \
+	((daos_unit_oid_t)(ep_oid)            CRT_VAR)                    \
+	((daos_key_t)     (ep_dkey)           CRT_VAR)                    \
+	((uint64_t)       (ep_barrier_epoch)  CRT_VAR)                    \
+	((uint32_t)       (ep_map_ver)        CRT_VAR)                    \
+	((uint32_t)       (ep_padding)        CRT_VAR)                    \
+	((struct daos_req_comm_in) (ep_comm_in) CRT_VAR)
+
+#define DAOS_OSEQ_OBJ_EC_PARITY /* output fields */                  \
+	((int32_t)        (ep_status)         CRT_VAR)                    \
+	((uint32_t)       (ep_map_ver)        CRT_VAR)                    \
+	((struct daos_req_comm_out) (ep_comm_out) CRT_VAR)
+
+CRT_RPC_DECLARE(obj_ec_parity, DAOS_ISEQ_OBJ_EC_PARITY, DAOS_OSEQ_OBJ_EC_PARITY)
 
 /* object key2anchor in/out */
 #define DAOS_ISEQ_OBJ_KEY2ANCHOR	/* input fields */	 \

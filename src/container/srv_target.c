@@ -31,8 +31,10 @@
 #include <daos_srv/vos.h>
 #include <daos_srv/iv.h>
 #include <daos_srv/srv_obj_ec.h>
+#include <daos_srv/agg_barrier.h>
 #include "rpc.h"
 #include "srv_internal.h"
+#include "../object/srv_internal.h"
 #include <daos/cont_props.h>
 #include <daos/dedup.h>
 
@@ -75,6 +77,23 @@ agg_rate_ctl(void *arg)
 
 	/* System is busy and no space pressure, let aggregation run in slack mode */
 	return 1;
+}
+
+/* Wrapper for EC parity create callback - calls the obj module function */
+static int
+agg_ec_parity_create_wrapper(void *cb_arg, daos_epoch_t barrier_epoch,
+			      daos_key_t *dkey, daos_unit_oid_t oid,
+			      daos_handle_t coh)
+{
+	return ec_parity_create(barrier_epoch, dkey, oid, coh);
+}
+
+/* Wrapper for barrier cleanup callback - calls the obj module function */
+static int
+agg_barrier_cleanup_wrapper(void *cb_arg, daos_unit_oid_t oid,
+			     daos_handle_t coh, daos_key_t *dkey)
+{
+	return agg_barrier_cleanup(oid, coh, dkey);
 }
 
 int
@@ -518,7 +537,13 @@ cont_vos_aggregate_cb(struct ds_cont_child *cont, daos_epoch_range_t *epr,
 {
 	int rc;
 
-	rc = vos_aggregate(cont->sc_hdl, epr, agg_rate_ctl, param, flags);
+	/* Note: For regular VOS aggregation, we pass NULL as oclass_attr.
+	 * The container's object class is only needed for EC-specific
+	 * aggregation, which has its own separate code path.
+	 */
+	rc = vos_aggregate_with_callbacks(cont->sc_hdl, epr, agg_rate_ctl, param,
+					  agg_ec_parity_create_wrapper, agg_barrier_cleanup_wrapper,
+					  NULL, NULL, flags);
 
 	/* Suppress csum error and continue on other epoch ranges */
 	if (rc == -DER_CSUM)

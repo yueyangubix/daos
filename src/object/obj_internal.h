@@ -208,7 +208,11 @@ struct obj_reasb_req {
 	/* orr_fail allocated flag, recovery task's orr_fail is inherited */
 					 orr_fail_alloc:1,
 	/* The fetch data/sgl is rebuilt by EC parity rebuild */
-					 orr_recov_data:1;
+					 orr_recov_data:1,
+	/* need to add aggregation barrier iod for EC write with parity data */
+					 orr_add_barrier:1;
+	/* barrier akey name pointer (heap allocated) */
+	char				*orr_barrier_akey;
 };
 
 static inline void
@@ -403,7 +407,7 @@ struct shard_k2a_args {
 	daos_anchor_t		*ka_anchor;
 };
 
-#define OBJ_TGT_INLINE_NR	9
+#define OBJ_TGT_INLINE_NR	8
 #define OBJ_INLINE_BTIMAP	4
 
 struct obj_req_tgts {
@@ -470,7 +474,7 @@ struct obj_auxi_args {
 	    nvme_io_err : 1, no_retry : 1, ec_wait_recov : 1, ec_in_recov : 1, rebuilding : 1,
 	    sub_anchors : 1, ec_degrade_fetch : 1, long_retry_delay : 1, cond_fetch_split : 1,
 	    cond_modify : 1, reintegrating : 1, tx_renew : 1, tx_convert : 1, req_dup_sgl : 1,
-	    for_migrate : 1;
+	    for_migrate : 1, ec_full_stripe_barrier : 1;
 	/* request flags. currently only: ORF_RESEND */
 	uint32_t                         specified_shard;
 	uint32_t                         flags;
